@@ -378,6 +378,9 @@ def _get_squad(squad_id: int) -> dict:
             "name": f"SQUAD-{sid + 1}",
             "auth_members": set(),
             "game_members": set(),
+            "in_match": set(),
+            "last_match_players": set(),
+            "needs_reinvite": set(),
             "team_state": {"peers": {}, "leader_uid": None, "team_code": None, "lock": asyncio.Lock()},
             "sync_state": {"lock": asyncio.Lock(), "finished_bots": set(), "event": asyncio.Event()},
             "stuck_state": {"lock": asyncio.Lock(), "in_team_since": {}, "triggered": False},
@@ -445,6 +448,31 @@ def _unassign_from_squad(uid: str):
             sq["team_state"]["leader_uid"] = None
             sq["team_state"]["team_code"] = None
         sq["stuck_state"]["in_team_since"].pop(uid, None)
+        sq["in_match"].discard(uid)
+        sq["last_match_players"].discard(uid)
+        sq["needs_reinvite"].discard(uid)
+
+async def _log_squad_match_entry(sq: dict):
+    try:
+        await asyncio.sleep(3.5)
+        async with sq["sync_state"]["lock"]:
+            entered = set(sq["last_match_players"])
+        async with sq["team_state"]["lock"]:
+            online_peers = set(sq["team_state"]["peers"].keys())
+        total_online = len(online_peers)
+        n_entered = len(entered)
+        missed_online = sorted(online_peers - entered)
+        if missed_online:
+            print_warning(
+                f"[{sq['name']}] 🎮 গেমে প্রবেশ: {n_entered}/{total_online} জন ম্যাচে গিয়েছে | "
+                f"যেতে পারেনি (অনলাইন): {', '.join(missed_online)} → ম্যাচ শেষে পরবর্তী ম্যাচে গ্রুপে ডেকে নেওয়া হবে!"
+            )
+        else:
+            print_success(
+                f"[{sq['name']}] 🎮 গেমে প্রবেশ: {n_entered}/{total_online} জন সবাই সঠিকভাবে ম্যাচের মধ্যে গিয়েছে!"
+            )
+    except Exception:
+        pass
 
 async def _mark_bot_match_finished(account_id, squad_id: Optional[int] = None):
     uid_str = str(account_id)
@@ -461,10 +489,12 @@ async def _mark_bot_match_finished(account_id, squad_id: Optional[int] = None):
             u for u in squad_peers
             if bot_state.accounts.get(u, {}).get("status") not in ("OFFLINE",)
         }
-        target = max(1, min(TEAM_SIZE, len(active_ids))) if active_ids else TEAM_SIZE
+        match_players = (sq["last_match_players"] & active_ids) or active_ids
+        target = max(1, min(TEAM_SIZE, len(match_players))) if match_players else TEAM_SIZE
+        still_playing = {u for u in sq["in_match"] if u != uid_str}
         print_success(f"[MATCH-DONE][{sq['name']}] Bot {uid_str} finished ({n_done}/{target})")
-        if n_done >= target:
-            print_premium(f"✅ [{sq['name']}] অল {target} বটস লবিতে ফিরেছে! একটুও দেরি না করে পরবর্তী ম্যাচ শুরু হচ্ছে...",
+        if n_done >= target and not still_playing:
+            print_premium(f"✅ [{sq['name']}] ম্যাচ সম্পূর্ণ! অল {target} বটস লবিতে ফিরেছে...",
                           color=PX.EMERALD, icon=I["rocket"])
             sync_state["event"].set()
 
@@ -474,8 +504,15 @@ async def _wait_for_all_bots_finished(account_id, squad_id: Optional[int] = None
     sq = _get_squad(sid)
     sync_state = sq["sync_state"]
     await _mark_bot_match_finished(uid_str, sid)
+    wait_deadline = time.time() + CS_MAX_MATCH_DURATION
+    while time.time() < wait_deadline:
+        async with sync_state["lock"]:
+            still_playing = {u for u in sq["in_match"] if u != uid_str}
+        if not still_playing:
+            break
+        await asyncio.sleep(1.0)
+    await _mark_bot_match_finished(uid_str, sid)
     try:
-        # শুধুমাত্র এই স্কোয়াডের সব বটের ম্যাচ শেষ হওয়ার অপেক্ষা (সর্বোচ্চ ১৫ সেকেন্ড)
         await asyncio.wait_for(sync_state["event"].wait(), timeout=15.0)
     except asyncio.TimeoutError:
         print_warning(f"[SYNC][{sq['name']}] অপেক্ষা শেষ, পরের ম্যাচ শুরু করা হচ্ছে...")
@@ -2694,6 +2731,13 @@ async def play_game_cs(server_ip_port, thunder, sharma, udp_key, match_code,
         if sock:
             try: sock.close()
             except Exception: pass
+        try:
+            sq_ = _get_squad(_get_squad_id(uid_str))
+            sq_["in_match"].discard(uid_str)
+            if not completed_cleanly:
+                sq_["needs_reinvite"].add(uid_str)
+        except Exception:
+            pass
         if completed_cleanly:
             try:
                 bot_state.increment_match(uid_str)
@@ -2835,6 +2879,15 @@ async def functional_cs_squad(addrs, starter_packet, account_region, client_vers
                 try: own_id_num = int(uid_str)
                 except Exception: own_id_num = 0
 
+            # স্কোয়াডের অন্য কোনো বট তখনও ম্যাচে থাকলে ম্যাচ কমপ্লিট হওয়া পর্যন্ত অপেক্ষা
+            while _team_active["flag"]:
+                async with sq["sync_state"]["lock"]:
+                    others_in_match = {u for u in sq["in_match"] if u != uid_str}
+                if not others_in_match:
+                    break
+                if bot_state.is_paused(uid_str): return
+                await asyncio.sleep(1.0)
+
             expected_size = min(TEAM_SIZE, max(1, len(sq["auth_members"])))
             invited_writers = {}
 
@@ -2870,19 +2923,82 @@ async def functional_cs_squad(addrs, starter_packet, account_region, client_vers
                     except Exception: pass
                     await asyncio.sleep(0.5)
 
+                async with sq["sync_state"]["lock"]:
+                    sq["needs_reinvite"].clear()
                 await asyncio.sleep(TEAM_INVITE_WAIT + 2.0)
             else:
-                print_premium(f"[{squad_name}] TEAM রি-ম্যাচ: লিডার {uid_str} সরাসরি পরবর্তী ম্যাচ শুরু করছে...", color=PX.EMERALD, icon=I["rocket"])
+                async with sq["sync_state"]["lock"]:
+                    last_players = set(sq["last_match_players"])
+                    reinvite_set = set(sq["needs_reinvite"])
                 async with team_state["lock"]:
-                    for peer_uid, peer_info in team_state["peers"].items():
+                    peers_snapshot = dict(team_state["peers"])
+
+                missed_peers = {
+                    pu: pi for pu, pi in peers_snapshot.items()
+                    if pu != uid_str and (pu not in last_players or pu in reinvite_set)
+                }
+                leader_missed = (uid_str not in last_players) or (uid_str in reinvite_set)
+
+                if leader_missed:
+                    print_premium(f"[{squad_name}] ⚠️ লিডার {uid_str} আগের ম্যাচে ছিল না — ম্যাচ শেষে গ্রুপ নতুন করে তৈরি হচ্ছে...",
+                                  color=PX.AMBER, icon=I["warn"])
+                    try:
+                        pkt = create_team(current_key, current_iv, region=account_region,
+                                          game_version=client_version, mode_id=CS_MODE_ID)
+                        if _writer_ref["w"] and not _writer_ref["w"].is_closing():
+                            _writer_ref["w"].write(pkt); await _writer_ref["w"].drain()
+                    except Exception as e: print_error(f"[{squad_name}] TEAM recreate err: {e}")
+                    await asyncio.sleep(1.5)
+                    for peer_uid, peer_info in peers_snapshot.items():
+                        if peer_uid == uid_str: continue
+                        peer_acc = peer_info.get("data", {}).get("account_id") or peer_uid
+                        try:
+                            inv = invite_player_in_team(int(peer_acc), current_key, current_iv, region=account_region)
+                            if _writer_ref["w"] and not _writer_ref["w"].is_closing():
+                                _writer_ref["w"].write(inv); await _writer_ref["w"].drain()
+                                invited_writers[peer_uid] = peer_info.get("writer")
+                        except Exception: pass
+                        await asyncio.sleep(0.5)
+                    async with sq["sync_state"]["lock"]:
+                        sq["needs_reinvite"].clear()
+                    await asyncio.sleep(TEAM_INVITE_WAIT + 2.0)
+                elif missed_peers:
+                    print_premium(f"[{squad_name}] ⚠️ {len(missed_peers)} জন বট ({', '.join(missed_peers.keys())}) আগের ম্যাচে যায়নি/বাইরে ছিল — গ্রুপে ডাকা হচ্ছে...",
+                                  color=PX.AMBER, icon=I["warn"])
+                    for peer_uid, peer_info in peers_snapshot.items():
+                        if peer_uid != uid_str and peer_uid not in missed_peers:
+                            invited_writers[peer_uid] = peer_info.get("writer")
+                    try:
+                        pkt = team_fresh(int(own_id_num), current_key, current_iv)
+                        if _writer_ref["w"] and not _writer_ref["w"].is_closing():
+                            _writer_ref["w"].write(pkt); await _writer_ref["w"].drain()
+                    except Exception: pass
+                    await asyncio.sleep(1.2)
+                    for peer_uid, peer_info in missed_peers.items():
+                        peer_acc = peer_info.get("data", {}).get("account_id") or peer_uid
+                        try:
+                            inv = invite_player_in_team(int(peer_acc), current_key, current_iv, region=account_region)
+                            if _writer_ref["w"] and not _writer_ref["w"].is_closing():
+                                _writer_ref["w"].write(inv); await _writer_ref["w"].drain()
+                                invited_writers[peer_uid] = peer_info.get("writer")
+                                print_success(f"[{squad_name}] 📩 {peer_uid} কে গ্রুপে ডাকা হয়েছে")
+                        except Exception: pass
+                        await asyncio.sleep(0.5)
+                    async with sq["sync_state"]["lock"]:
+                        for pu in missed_peers:
+                            sq["needs_reinvite"].discard(pu)
+                    await asyncio.sleep(TEAM_INVITE_WAIT + 2.0)
+                else:
+                    print_premium(f"[{squad_name}] TEAM রি-ম্যাচ: লিডার {uid_str} সরাসরি পরবর্তী ম্যাচ শুরু করছে...", color=PX.EMERALD, icon=I["rocket"])
+                    for peer_uid, peer_info in peers_snapshot.items():
                         if peer_uid != uid_str:
                             invited_writers[peer_uid] = peer_info.get("writer")
-                try:
-                    pkt = team_fresh(int(own_id_num), current_key, current_iv)
-                    if _writer_ref["w"] and not _writer_ref["w"].is_closing():
-                        _writer_ref["w"].write(pkt); await _writer_ref["w"].drain()
-                except Exception: pass
-                await asyncio.sleep(1.0)
+                    try:
+                        pkt = team_fresh(int(own_id_num), current_key, current_iv)
+                        if _writer_ref["w"] and not _writer_ref["w"].is_closing():
+                            _writer_ref["w"].write(pkt); await _writer_ref["w"].drain()
+                    except Exception: pass
+                    await asyncio.sleep(1.0)
 
             try: bot_state.update_status(uid_str, "SEARCHING", 0)
             except Exception: pass
@@ -3128,6 +3244,16 @@ async def functional_cs_squad(addrs, starter_packet, account_region, client_vers
                                     bot_state.update_status(uid_str, "IN_MATCH (CS)", 1)
                                 except Exception: pass
                                 
+                                async with sq["sync_state"]["lock"]:
+                                    is_first_entry = (len(sq["in_match"]) == 0)
+                                    if is_first_entry:
+                                        sq["last_match_players"].clear()
+                                    sq["in_match"].add(uid_str)
+                                    sq["last_match_players"].add(uid_str)
+                                    sq["needs_reinvite"].discard(uid_str)
+                                if is_first_entry:
+                                    asyncio.create_task(_log_squad_match_entry(sq))
+
                                 new_match = asyncio.create_task(
                                     play_game_cs(server_ip_port, thunder, sharma, udp_key,
                                                  match_code, effective_acc_id, "ID",
@@ -3149,6 +3275,8 @@ async def functional_cs_squad(addrs, starter_packet, account_region, client_vers
                                 try: await new_match
                                 except Exception as e: print_error(f"[{squad_name}] Match #{match_index} {e}")
                                 finally:
+                                    async with sq["sync_state"]["lock"]:
+                                        sq["in_match"].discard(uid_str)
                                     drain_task.cancel()
                                     try: await drain_task
                                     except asyncio.CancelledError: pass
@@ -3185,6 +3313,8 @@ async def functional_cs_squad(addrs, starter_packet, account_region, client_vers
                 await asyncio.sleep(min(reconnects * 0.5, 2.0))
             finally:
                 _team_active["flag"] = False
+                async with sq["sync_state"]["lock"]:
+                    sq["in_match"].discard(uid_str)
                 async with team_state["lock"]:
                     team_state["peers"].pop(uid_str, None)
                     if team_state["leader_uid"] == uid_str:
